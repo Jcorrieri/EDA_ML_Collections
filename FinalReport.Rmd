@@ -1,0 +1,1317 @@
+---
+title: "Maximizing Enjoyment: Reducing Wait Times at Walt Disney World"
+output: github_document
+date: "2024-05-18"
+---
+
+Group 4 - Jacomo Corrieri, Kim Minyeong, Lee Jimin
+
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+```
+
+
+0.) Loading libraries
+
+```{r, echo = FALSE, message = FALSE, results = 'hide'}
+if (!require(dplyr) ) {
+  install.packages("dplyr", repos = "http://cran.us.r-project.org")
+}
+
+if (!require(magrittr)) {
+  install.packages("magrittr", repos = "http://cran.us.r-project.org")
+}
+
+if (!require(lubridate)) {
+  install.packages("lubridate", repos = "http://cran.us.r-project.org")
+}
+if (!require(readxl)) {
+  install.packages("readxl", repos = "http://cran.us.r-project.org")
+}
+if (!require(car)) {
+  install.packages("car")
+}
+if (!require(tidyr)) {
+  install.packages("tidyr", repos = "http://cran.us.r-project.org")
+}
+if (!require(corrplot)){
+  install.packages("corrplot", repos = "http://cran.us.r-project.org")
+}
+if (!require(ggplot2)){
+  install.packages("ggplot2", repos = "http://cran.us.r-project.org")
+}
+```
+
+
+```{r, echo = FALSE, message = FALSE, results = 'hide'}
+library(dplyr)
+library(magrittr)
+library(lubridate)
+library(ggplot2)
+library(readxl)
+library(tidyr)
+library(corrplot)
+```
+
+[Reading in each data set]
+
+```{r}
+waiting_times <- read.csv("waiting_times.csv")
+weather_data <- read.csv("weather_data.csv")
+```
+
+```{r, include = FALSE}
+# Glossary for personal use, provided as a standalone dataset. Contains
+# descriptions for each column.
+glossary <- read_excel("glossary.xlsx", sheet = "Glossary", range = cell_rows(5:23));glossary
+```
+
+```{r}
+# Creating a function Dictionary to print the description of the input variable
+Dictionary <- function(name_list){
+  for (col in name_list){
+    cat(paste(col, glossary$Description[glossary$'Variable name' == col], sep = "\t\t"), "\n")
+  }
+}
+```
+
+The data sets are extremely large, so we need to trim them down to usable subsets
+while still fairly representing the data. 
+
+Waiting_times - 3,509,324 obs. of 14 variables
+Weather_data - 207264 obs. of 28 variables
+
+### Analyzing Waiting Times Data. 
+
+```{r}
+colnames(waiting_times)
+```
+
+To begin our pre-processing, we wanted to get a good idea of how we could trim
+the data contained in the waiting times data set while preserving as much as 
+possible. 
+
+### Determining the Number of Recorded Rides
+
+```{r}
+all_rides <- select(waiting_times, ENTITY_DESCRIPTION_SHORT) %>% distinct();
+all_rides <- all_rides$ENTITY_DESCRIPTION_SHORT
+table(all_rides)
+cat("Number of unique rides:", length(all_rides))
+```
+
+It seems like there are 39 unique rides listed in waiting_times, however.. 
+
+```{r}
+# Group "waiting_times" by WORK_DATE and DEB_TIME
+grouped_rides <- waiting_times %>%
+  group_by(WORK_DATE, DEB_TIME) %>%
+  summarise(ride_names = (paste(unique(ENTITY_DESCRIPTION_SHORT), collapse = ", ")), .groups = 'drop')
+
+# Calculate the length of each ride_names
+grouped_rides <- grouped_rides %>%
+  rowwise() %>%
+  mutate(num_rides = length(unique(strsplit(ride_names, ", ")[[1]]))) %>%
+  select(1:2, num_rides, everything())
+
+# Check the date when it changed
+change_point <- which(diff(grouped_rides$num_rides) > 0 & grouped_rides$num_rides[-1] == 39)[1]
+grouped_rides[change_point:(change_point+1), ]
+
+# Check which attractions are added
+attractions_list <- waiting_times %>%
+  filter(WORK_DATE == waiting_times$WORK_DATE[change_point] & DEB_TIME == waiting_times$DEB_TIME[change_point]) %>%
+  pull(ENTITY_DESCRIPTION_SHORT)
+
+all_rides[!(all_rides %in% attractions_list)]
+```
+
+Two attractions("Vertical Drop", "Tilt-A-Whirl") increased from 37 to 39 on June 9th of 2022.
+
+Knowing this, we wanted to see how many entries per day exist in the data set:
+
+```{r}
+waiting_times %>% group_by(WORK_DATE) %>% summarise(count = n()) %>% head()
+```
+
+There are ~2072 entries per day, so (2072 entries) * (1,691 rows) = 3.5M obs.
+
+When looking at the different columns, we can see that several of them deal 
+with the time data. First, we wanted to see if any of these columns were 
+redundant. 
+
+### Looking at waiting_times DEB_TIME and FIN_TIME
+
+```{r, include = FALSE}
+all((ymd_hms(waiting_times$DEB_TIME) + minutes(15)) == ymd_hms(waiting_times$FIN_TIME))
+```
+
+Every FIN_TIME shows the time which is 15 minutes after of DEB_TIME.
+
+Also, every DEB_TIME is recorded in 15 minutes interval.
+
+```{r, include=FALSE}
+# Check if all minutes are either 0, 15, 30, or 45
+all(minute(ymd_hms(waiting_times$DEB_TIME)) %in% c(0, 15, 30, 45))
+
+# Check the time difference
+all(ymd_hms(waiting_times$DEB_TIME) == floor_date(ymd_hms(waiting_times$DEB_TIME), "15 minutes"))
+```
+
+It means the observations are recorded in 15 minute intervals. 
+
+```{r, include=FALSE}
+all(hour(ymd_hms(waiting_times$DEB_TIME)) == waiting_times$DEB_TIME_HOUR)
+```
+
+### Finding out how to condense the data set - trimming by time of day
+
+Here, we wanted to check the first and last times listed in the day. This gives
+us a range of time when the park is operating, or at least for the entries
+are being recorded. 
+
+```{r, include=FALSE}
+# The first time and the last time of record for each days 
+time_ranges_by_date <- waiting_times %>%
+  group_by(WORK_DATE) %>%
+  summarise(
+    first_DEB_TIME = min(DEB_TIME, na.rm = TRUE),
+    last_DEB_TIME = max(DEB_TIME, na.rm = TRUE)
+  )
+
+# Every first DEB_TIME is recorded at 09:00
+all(grepl("09:00:00.000", time_ranges_by_date$first_DEB_TIME))
+
+# Every last DEB_TIME is recorded at 22:45
+all(grepl("22:45:00.000", time_ranges_by_date$last_DEB_TIME))
+```
+
+Every first DEB_TIME, the beginning of the 15 minute observation, is 
+entered at 9am. The last recorded observations are at 22:45pm. 
+
+With this information in mind, we came up with the idea to change the recorded
+time information for each ride entry into a categorical column. This new column, 
+'TIME_OF_DAY', will split the time data into four categories: 'Dawn', 'Morning',
+'Afternoon', 'Night'.
+
+DEB_TIME_HOUR shows the hour part of DEB_TIME, so we no longer need DEB_TIME. 
+
+FIN_TIME is also not needed, now that we know it only represents the end of 
+the recorded observation. We only need the hour data. 
+
+Therefore, 'FIN_TIME' and 'DEB_TIME' are redundant columns which 
+are okay to be deleted.
+
+```{r}
+waiting_times <- waiting_times[,-c(2,4)]
+```
+
+The time range of the observations (9am to 22:45pm) is 13 hours. When we divide 
+this into three, it is 4 hours 20 minutes for each. However, we cannot use 
+20 minutes unit because the "waiting_times" is recorded in 15 minutes intervals 
+and "weather_data" is recorded in 1 hour interval.
+
+So, we split 4-5-5 hours for each categories considering 
+common sense of lunch and dinner time. 
+
+### TIME_OF_DAY 
+
+* Night [23 ~ 08] [23, 9) <- Park isn't operating
+
+* Morning [09 ~ 12] [9, 13) = 4 hours
+* Afternoon [13 ~ 17] [13, 18) = 5 hours
+* Evening [18 ~ 22] [18, 23) = 5 hours
+
+To do this, we used cut() to split up and average the waiting_times information
+across these categories. 
+
+```{r}
+TIME_OF_DAY <- cut(waiting_times$DEB_TIME_HOUR, 
+                           breaks = c(-1, 9, 13, 18, 23, 24), 
+                           labels = c("Night", "Morning", "Afternoon", "Evening", "Night"),
+                           right = FALSE)
+
+waiting_times <- cbind(waiting_times, TIME_OF_DAY)
+waiting_times <- waiting_times[c(1, 13, 2:12)]
+```
+
+```{r}
+#Averaging columns of "waiting_times" by 'WORK_DATE', 'TIME_OF_DAY', and
+#'ENTITY_DESCRIPTION_SHORT'
+
+waiting_times <- waiting_times %>%
+  group_by(WORK_DATE, TIME_OF_DAY, ENTITY_DESCRIPTION_SHORT) %>%
+  summarise(
+    AVG_WAIT_TIME = mean(WAIT_TIME_MAX),
+    across(NB_UNITS:NB_MAX_UNIT, ~ mean(.x, na.rm = TRUE)),
+    .groups = 'drop'
+  )
+
+head(waiting_times)
+```
+
+We also updated the column names to better reflect the data. 
+
+```{r}
+colnames(waiting_times) <- c("DATE", "TIME_OF_DAY", "RIDE", "AVG_WAIT_TIME", "NB_UNITS", "GUESTS_CARRIED", "CAPACITY", "ADJUSTED CAPACITY", "OPEN_TIME", "UPTIME", "DOWNTIME", "MAX_UNITS")
+waiting_times$DATE <- ymd(waiting_times$DATE)
+
+colnames(waiting_times)
+```
+
+```{r}
+# Reflect the change to the "glossary"
+## Variable
+glossary <- glossary %>%
+  mutate(`Variable name` = case_when(
+    `Variable name` == "WORK_DATE" ~ "DATE",
+    `Variable name` == "ENTITY_DESCRIPTION_SHORT" ~ "RIDE",
+    `Variable name` == "WAIT_TIME_MAX" ~ "AVG_WAIT_TIME",
+    TRUE ~ `Variable name` # Remain the other variables
+  ))
+## Description
+glossary <- glossary %>%
+  mutate(Description = if_else(`Variable name` == "AVG_WAIT_TIME", paste(Description, "-> Averaged it"), Description))
+```
+
+This is the end of our general pre-processing for waiting_times. Now, we 
+need to see what we can do to trim the weather data and prepare it to be 
+merged.
+
+```{r}
+# Creating a function, Removal, for personal use and convenience to remove 
+# select columns
+
+Removal <- function(data, remove, dir = 1){
+  if (dir == 0){
+    data <- data[-remove,] # remove row data
+  }
+  else {
+    data <- select(data, -all_of(remove)) # remove column data
+  }
+  
+  remove <- c() # reset the 'remove'
+  
+  return (data)
+}
+```
+
+```{r}
+# We will use 'df' as a temporary weather_data variable.
+df <- weather_data
+```
+
+### Columns Which Contain Unique Values
+
+First, let's figure out columns which only contains only one unique value. 
+These columns will be removed from the weather data. 
+
+```{r}
+remove_wd <- c()
+
+col_wd <- colnames(df)
+
+for (col in col_wd){
+  val <- unique(df[ , col])
+  if (length(val) == 1){
+    cat("Removing:", col, " ")
+    df <- Removal(df, col, 1) 
+  }
+}
+```
+
+### Different columns with different formats. 
+
+The columns 'dt' and 'dt_iso' contain the same information. 'dt' is a unix 
+timestep(s) after 1970-1-1 time 00:00:00 UTC. 'dt_iso' is the date and time  
+given in ISO 8601 standard format. We can check it with the code below as well. 
+It shows 'dt' can be converted into 'dt_iso' using 10 rows. 
+
+```{r}
+print("dt data")
+dt <- head(df$dt); dt
+
+print("dt_iso data")
+dt_iso <- as.POSIXct(dt, origin = "1970-01-01", tz = "UTC"); dt_iso
+
+# Remove dt
+df <- Removal(df, "dt", 1) 
+```
+Continuing on, we noticed that 'weather_id' and 'weather_description' mean the
+same thing, just as different data types (integer and character)
+
+```{r}
+id_desc_wd <- unique(df[ , c("weather_id", "weather_description")]); 
+head(id_desc_wd)
+
+# remove weather_id
+df <- Removal(df, "weather_id", 1) 
+```
+
+Weather icon and weather description represent the same information. So, we
+have decided to remove the weather icon column and keep the string descriptors.
+
+```{r}
+des_icon_wd <- unique(df[ , c("weather_description", "weather_icon")])
+
+head(des_icon_wd[order(des_icon_wd$weather_icon), ])
+
+# remove weather_icon
+df <- Removal(df, "weather_icon", 1) 
+```
+
+After everything, 10 columns were removed from weather data. 
+
+```{r}
+cat("Original Weather Data # of columns:", length(weather_data))
+cat("New Weather Data # of columns:",length(df))
+```
+Updating weather_data
+
+```{r}
+weather_data <- df
+```
+
+In order to work towards combining each data set, we want to find a common 
+variable. Based on our initial analysis, both data sets contain detailed 
+date and time information. However, there are some discrepancies in the format
+and the time span.
+
+First, let's standardize the given time in weather_data removing the UTC 
+information, as each entry has the same value (+0000 UTC).
+
+```{r}
+weather_data <- mutate(weather_data, dt_iso = substr(dt_iso, 1, 19)); 
+cat("New time format:", weather_data$dt_iso[1])
+```
+
+Here, we're analyzing the weather time data to see how it is entered. By 
+taking the unique times listed, we discovered that the data is recorded by
+hour in 24-hour format. 
+
+```{r}
+time <- format(as.POSIXct(weather_data$dt_iso, format = "%Y-%m-%d %H:%M:%S"), "%H:%M:%S")
+
+unique(time)
+```
+
+Reformatting the date column into a DATE variable and storing the data in a new
+column DATE. We are also storing just the hour from the given time info, as 
+the minutes and seconds are redundant and contain zero for each entry. 
+
+```{r}
+# Make a new column 'DATE'(chr) and 'DEB_TIME_HOUR'(int) in front and remove a 'dt_iso' column
+# Shorten version ?????
+weather_data <- weather_data %>%
+  mutate(DATE = as.Date(weather_data$dt_iso),
+         DEB_TIME_HOUR = as.integer(format(as.POSIXct(weather_data$dt_iso, format = "%Y-%m-%d %H:%M:%S"), "%H"))) %>%
+  select(DATE, DEB_TIME_HOUR, everything())
+weather_data$dt_iso <- NULL
+
+```
+
+Now that we've done some work reformatting our time data, we could check the 
+range of each data set.
+
+```{r}
+print("The date range of 'weather_data'")
+cat("Min date: ", format(min(weather_data$DATE), "%Y-%m-%d"), "\n")
+cat("Max date: ", format(max(weather_data$DATE), "%Y-%m-%d"), "\n")
+
+print("The date range of 'waiting_times'")
+cat("Min date: ", format(min(waiting_times$DATE), "%Y-%m-%d"), "\n")
+cat("Max date: ", format(max(waiting_times$DATE), "%Y-%m-%d"), "\n")
+```
+As shown, each data set spans a different range of time. Since our main focus
+is on the ride data provided in waiting_times, we decided to trim the weather
+data to match it. 
+
+We can thus remove the weather from 1999 to 2017
+
+### Trimming weather_data from 2018 onward to align with waiting_times range
+
+```{r}
+weather_data <- filter(weather_data, (ymd(DATE) %>% year()) > 2017)
+weather_data <- filter(weather_data, ymd(DATE) < "2022-08-19")
+
+print("The date range of 'weather_data'")
+cat("Min date: ", format(min(weather_data$DATE), "%Y-%m-%d"), "\n")
+cat("Max date: ", format(max(weather_data$DATE), "%Y-%m-%d"), "\n")
+```
+
+Processing weather_data further, we noticed a variable called "weather_main"
+which summarized the given weather descriptions into the following categories: 
+
+```{r}
+unique(weather_data$weather_main)
+```
+
+However, we chose to keep the more detailed descriptions of the weather to 
+distinguish its varying intensity, as it may lead to better insights. 
+
+We changed the 'weather_main' column to keep a summarized collection of each
+category, distinguishing the weather as follows: Clear, Cloudy, Light Rain/Snow,
+Moderate or Heavy Rain/Snow.
+
+This gives us a concise description of the weather for each day. 
+
+```{r}
+weather_data$weather_main <- ifelse(weather_data$weather_description %in% c("sky is clear", "few clouds"), "Clear",
+                                   ifelse(weather_data$weather_description %in% c("scattered clouds", "broken clouds", "overcast clouds"), "Cloudy",
+                                          ifelse(weather_data$weather_description %in% c("light rain", "light snow"), "Light Rain/Snow",
+                                                 ifelse(weather_data$weather_description %in% c("moderate rain", "snow", "heavy intensity rain"), "Moderate or Heavy Rain/Snow", NA))))
+
+weather_data$weather_main <- factor(weather_data$weather_main, levels =  c("Clear", "Cloudy", "Light Rain/Snow", "Moderate or Heavy Rain/Snow")) # higher level, harder to wait
+
+unique(weather_data$weather_main)
+```
+
+### Reducing the size of weather_data by splitting the time into categories
+
+To apply the weather information to the "waiting_times", 
+we have to use the same criteria as we used in "waiting_times."
+
+This way, we can reduce the size of the weather data further while also
+preparing some common columns (DATE and TIME_OF_DAY) to join the data sets
+together. 
+  
+### TIME_OF_DAY ["weather_data" criteria] ["waiting_times" criteria)
+
+* Night [23 ~ 08] [23, 9)
+* Morning [09 ~ 12] [9, 13) = 4 hours
+* Afternoon [13 ~ 17] [13, 18) = 5 hours
+* Evening [18 ~ 22] [18, 23) = 5 hours
+
+```{r, include = FALSE}
+# Add a new column 'TIME_OF_DAY' with four categories
+weather_data <- weather_data %>%
+  mutate(TIME_OF_DAY = cut(weather_data$DEB_TIME_HOUR, 
+                           breaks = c(-1, 9, 13, 18, 23, 24), 
+                           labels = c("Night", "Morning", "Afternoon", "Evening", "Night"),
+                           right = FALSE)) %>%
+  mutate(TIME_OF_DAY = factor(TIME_OF_DAY, levels = c("Night", "Morning", "Afternoon", "Evening"))) %>%
+  select(1:2, TIME_OF_DAY, everything())
+
+# Check the order of level 
+levels(weather_data$TIME_OF_DAY) 
+head(weather_data)
+```
+
+```{r}
+# Find mode, average and make concatenated list according to the columns ->  Update it to the "weather_data"
+weather_data <- weather_data %>%
+  group_by(DATE, TIME_OF_DAY) %>%
+  summarise(
+    timezone = as.numeric(names(sort(table(timezone), decreasing = TRUE)[1])),
+    across(temp:feels_like, ~ mean(.x, na.rm = TRUE)),
+    temp_min = min(temp_min, na.rm = TRUE),
+    temp_max = max(temp_max, na.rm = TRUE),
+    across(pressure:clouds_all, ~ mean(.x, na.rm = TRUE)),
+    weather_main = paste(weather_main, collapse = ", "),
+    weather_description = paste(weather_description, collapse = ", "),
+    .groups = 'drop'
+  )
+```
+
+Now that we have the data that we need from both waiting_times and weather_data,
+we can prepare to merge the data sets. 
+
+We decided to filter out all weather data
+that occurred during the "night" time of day as there are no waiting time
+entries during that period.
+
+Finally, we could perform a left join between the wait and weather data, 
+combining them via the DATE and TIME_OF_DAY columns. 
+
+```{r, echo = FALSE, message = FALSE, results = 'hide'}
+temp_weather_df <- weather_data %>% group_by(DATE, TIME_OF_DAY) %>% 
+  summarise(AVG_TEMP = temp, FEELS_LIKE = feels_like, TEMP_MIN = temp_min,
+            TEMP_MAX = temp_max, WIND_SPD = wind_speed, 
+            AVG_HUMIDITY = humidity,
+            WEATHER_DESCRIPTION = weather_description, 
+            .groups = 'drop')
+
+main_df <- left_join(waiting_times, temp_weather_df)
+
+
+# Check whether 'Night' data is included into the 'main_df' or not 
+if (sum(main_df$TIME_OF_DAY == "Night") == 0) {
+  print("Night is filtered out")
+} else {
+  print("Night is included")
+}
+```
+```{r}
+# Making a boolean "has_rain" column for convenient use later on
+main_df$HAS_RAIN <- grepl("rain", main_df$WEATHER_DESCRIPTION)
+```
+
+We also want to create a column, SEASON, so that we can compare seasonal data
+and identify seasonality. By using the lubridate package, we are able to extract
+the weekday, month, and year for each entry. 
+
+```{r}
+main_df$WDAY <- main_df$DATE %>% wday(label=TRUE)
+main_df$MONTH <- main_df$DATE %>% month(label=TRUE)
+main_df$YEAR <- main_df$DATE %>% year()
+
+winter <- c("Dec", "Jan", "Feb")
+spring <- c("Mar", "Apr", "May")
+summer <- c("Jun", "Jul", "Aug")
+fall <- c("Sep", "Oct", "Nov")
+
+main_df$SEASON <- ifelse(main_df$MONTH %in% winter, "Winter", 
+                  ifelse(main_df$MONTH %in% spring, "Spring", 
+                         ifelse(main_df$MONTH %in% summer, "Summer",
+                                ifelse(main_df$MONTH %in% fall, "Fall", ""))))
+
+main_df <- main_df[c(1, 23:21, 24, 2:20)]
+```
+
+```{r}
+colnames(main_df)
+```
+
+With the final modifications made to our combined data set, we could develop
+some inquiries we wanted to investigate further, including a main theme for this
+project:
+
+Suppose that Jimin and Minyeong want to visit Jacomo in Florida to go to
+Disney World. When would be the best time to come? During which conditions? 
+Which rides should they ride, and when would be the best time of day?
+
+While entertaining, this scenario is a realistic use case for the analysis of 
+our data, and we hoped to adequately solve these questions through our work. 
+However, we also developed some more general inquiries that were more
+technically-oriented:
+
+What variables have a visible linear effect on the average waiting times? 
+
+During which seasons, months, and days is the park busiest?
+
+---
+
+# EDA Graphs, Plots, and Explanations
+
+Grouping wait times by day and month using a heat map. 
+
+We can get an idea of the trend of this data across each relevant year using
+facet_wrap(). 
+
+```{r}
+main_df %>% group_by(WDAY, MONTH, YEAR) %>% 
+  summarise(wait = mean(AVG_WAIT_TIME), .groups = 'drop') %>% 
+  ggplot(aes(MONTH, WDAY, fill = wait)) + 
+  geom_tile(color = "white", lwd = 1.5, linetype = 1) + 
+  scale_fill_gradient(low = "white", high = "red") + coord_fixed() +
+  labs(title = "Average Wait by Weekday and Month 2018-2022", x = "", y = "", fill = "Wait (min)") + 
+  theme(axis.text.x = element_text(angle = 90)) + facet_wrap(~YEAR)
+```
+
+We immediately noticed the gaps during the Spring and Winter seasons of 2020
+and 2021, where the average waiting time seems to be nearly zero. 
+We wanted to understand this further. 
+
+Our logical assumption was that, due to COVID-19, the park must have been closed
+during these periods, resulting in the average wait time appearing to be zero. 
+However, we needed to find some evidence in the numbers themselves that would
+support our idea of a park closure. 
+
+The reason that this is important is because we want to find out the trend
+of the average wait time while the park is open and running. Data gathered
+when nobody was in attendance only serves to skew our mean average wait time
+(and other important data) across all rides, especially those periods where
+a large amount of zeroes are decreasing the overall average wait time. This 
+could lead to inaccurate findings. 
+
+To verify this, we simplified the data set and manually reviewed the entries.
+We used the built-in column sort to search by descending number of units 
+(NB_UNITS), where we could see a majority of the empty data. 
+
+We could see that as the lock down was starting, there were fewer and fewer
+entries with data above zero for columns such as guests_carried, open_time, and
+the number of units. Eventually, this trend disappeared and we found large
+sequences of entries holding zero for all metrics that matched up with the 
+observed time periods on our heat map. 
+
+```{r}
+View(main_df %>% filter( (YEAR == 2020 | YEAR == 2020) & 
+                           (SEASON == "Spring" | SEASON == "Winter")))
+```
+
+To be as fair as possible, we decided to remove only the entries that held
+zero for every relevant numeric column. 
+
+Columns 8:15 include: AVG_WAIT_TIME, NB_UNITS, GUESTS_CARRIED, CAPACITY, 
+ADJUSTED_CAPACITY, OPEN_TIME, UPTIME, DOWNTIME
+
+```{r}
+# Columns to check
+columns_to_check <- c(8:15)
+
+# Remove rows where all specified columns have the value zero
+open_main_df <- main_df %>%
+  filter(!rowSums(select(., all_of(columns_to_check)) == 0) == length(columns_to_check))
+```
+
+```{r}
+open_main_df %>% group_by(WDAY, MONTH, YEAR) %>% 
+  summarise(wait = mean(AVG_WAIT_TIME), .groups = 'drop') %>% 
+  ggplot(aes(MONTH, WDAY, fill = wait)) + 
+  geom_tile(color = "white", lwd = 1.5, linetype = 1) + 
+  scale_fill_gradient(low = "white", high = "red") + coord_fixed() +
+  labs(title = "Average Wait by Weekday and Month 2018-2022", x = "", y = "", fill = "Wait (min)") + 
+  theme(axis.text.x = element_text(angle = 90)) + facet_wrap(~YEAR)
+```
+
+Comparing this to the original graph, the trend remains the same.
+Therefore, removing the data affected by COVID still preserves the data set's 
+integrity. 
+
+Here is an updated table accompanying the graph. Looking at the busiest weekdays,
+it appears many lie on a Saturday, which is initially what we expected.
+
+```{r}
+open_main_df %>% group_by(WDAY, MONTH) %>% 
+  summarise(wait = mean(AVG_WAIT_TIME), .groups = 'drop') %>% arrange(desc(wait)) %>%
+  head()
+```
+
+Next, we created a basic graph showing an overview of the wait times across
+all rides by year. The general trend confirms that waiting times were, on average, 
+much lower due to COVID during 2020 and 2021 (We can see that in the Spring it 
+reached zero).
+
+```{r}
+open_main_df %>% group_by(YEAR, SEASON) %>% summarise(avg_time = mean(AVG_WAIT_TIME), .groups = 'drop') %>%
+  ggplot(aes(x = YEAR, y = avg_time, color = SEASON)) + geom_point() + geom_line() + xlab("Year") +
+  ylab("Average Wait Time (Minutes)") + ggtitle("Wait Time Across All Rides by Year")
+```
+
+---
+
+With a better understanding and basic visualization of our data, we began to 
+investigate our main theme - finding the best day and time to visit Disney World. 
+
+To start, we wanted to narrow down our search for the lowest waiting times by 
+looking at each season. We created a bar plot and accompanying table to do this.
+
+```{r}
+open_main_df %>% group_by(MONTH, SEASON) %>% 
+  summarise(AVG_WAIT_TIME = mean(AVG_WAIT_TIME), .groups = 'drop') %>%
+ggplot(aes(y = AVG_WAIT_TIME, x = MONTH, fill = SEASON)) + geom_col()
+```
+```{r}
+open_main_df %>% group_by(SEASON) %>% summarise(Average_Wait = mean(AVG_WAIT_TIME))
+```
+
+We can see that Summer has the highest waiting time, and that fall has 
+the lowest. For our purposes, we want to investigate the waiting times of both 
+the Fall (since it is the season with objectively the lowest average wait time)
+but also the Winter (second lowest season), as for Jimin and Minyeong it would
+better align with their Winter break as students. 
+
+From this point, we wanted to use our weather data to determine its effect
+on the wait times of rides. While our data set includes data about snow, the
+hot environment in Florida makes this incredibly rare, so we are focused primarily
+on the effect of rain. 
+
+```{r}
+# Filtering non rainy days
+no_rain_df <- open_main_df %>%
+  filter(!grepl("Rain|Snow", WEATHER_DESCRIPTION, ignore.case = TRUE))
+```
+
+```{r}
+# Filtering rainy days
+rain_df <- open_main_df %>%
+  filter(grepl("Rain|Snow", WEATHER_DESCRIPTION, ignore.case = TRUE))
+```
+
+```{r}
+# Getting the data in the presence of rain
+
+max_mean_rain <- rain_df %>%
+  group_by(RIDE) %>%
+  summarize(
+    max_avg_wait_time = max(AVG_WAIT_TIME),
+    mean_open_time = mean(OPEN_TIME),
+    .groups = 'drop'
+  )
+```
+
+```{r}
+# Getting the data when there is a lack of rain
+
+max_mean_norain <- no_rain_df %>%
+  group_by(RIDE) %>%
+  summarize(
+    max_avg_wait_time = max(AVG_WAIT_TIME),
+    mean_open_time = mean(OPEN_TIME),
+    .groups = 'drop'
+  )
+```   
+
+This table shows the numerical difference in waiting times and open times
+with the presence of rain (compared to when rain is absent)
+
+```{r}
+combined_df <- merge(max_mean_norain, max_mean_rain, by = "RIDE", suffixes = c("_norain", "_rain"))
+combined_df$avg_wait_time_difference <- combined_df$max_avg_wait_time_rain - combined_df$max_avg_wait_time_norain
+combined_df$open_time_difference <- combined_df$mean_open_time_rain - combined_df$mean_open_time_norain
+
+selected_columns <- c("RIDE", "avg_wait_time_difference", "open_time_difference")
+combined_df <- combined_df[selected_columns]
+head(combined_df)
+```
+
+The following plot visualizes the effect of rain on the maximum waiting time of
+each ride.
+
+```{r}
+ggplot(combined_df, aes(x = RIDE, y = avg_wait_time_difference)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  labs(title = "Difference in Maximum AVG_WAIT_TIME between Rain and No Rain",
+       x = "Ride",
+       y = "Difference") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+From this result, we can see that open time and down time are not that largely influenced by rain. However, max of avg waiting time is largely effected by rain. We can see that almost every ride decreased their waiting time when the weather is rainy. So we can conclude that we can wait less and enjoy more on little bit rainy days. 
+
+### Finding the Best Month
+
+Following the main theme of our report, we are okay even with light rain or snow 
+but don't want heavy rain, hoping to ride as many attractions as we can in decent
+conditions. According to this preference, we gave each weather_data$weather_description 
+a subjective score. 
+
+```{r}
+weather_score <- list(
+  "sky is clear" = 7,
+  "few clouds" = 5,
+  "scattered clouds" = 3,
+  "broken clouds" = 1,
+  "overcast clouds" = -1,
+  "light rain" = -2,
+  "moderate rain" = -4,
+  "light snow" = -3,
+  "snow" = -5,
+  "heavy intensity rain" = -10
+)
+```
+
+Then, we averaged the score, making a new temporary data frame, 'df'.
+```{r}
+# convert the description of 'weather_main' into a score
+open_main_df$weather_score <- sapply(open_main_df$WEATHER_DESCRIPTION, function(x) {
+  points <- unlist(strsplit(x, ", "))
+  sum(sapply(points, function(p) weather_score[[p]]))
+})
+
+# average
+open_main_df <- open_main_df %>%
+  mutate(
+    weather_score = ifelse(TIME_OF_DAY == 'Morning', weather_score / 4, weather_score / 5) 
+  )
+
+```
+
+Filter out August 2022 because there is no whole month data on August 2022.
+```{r}
+temp <-filter(open_main_df, (month(DATE) != 8 & year(DATE) != 2022))
+temp <- temp %>% group_by(DATE) %>% summarise(wait = mean(AVG_WAIT_TIME), weather = mean(weather_score)) ; temp
+
+# monthly: weather
+wts_month <- ts(temp$weather, start = c(2018, 1), end = c(2022, 7), frequency = 12)
+
+boxplot(wts_month~cycle(wts_month),xlab="Month", ylab = "Weather Score" ,main ="Monthly Weather Score Boxplot from 2018 to 2022")
+```
+
+In a boxplot of monthly weather score, it's showing more dynamic difference of
+weather score. Summer and spring have one of the highest weather score, which 
+means the weather is nice, but fall and winter are showing lower score.
+In fall, score distribution are quite even whereas January shows explicitly
+low weather score in winter. So we decided to compare February, March, September,
+October, and November in more detailed using weekly plot.
+
+We used a accumulated weather score of each weeks by years. However, as the
+year is later, the probability that weather would be similar as feature increases.
+So, we used weighted sum making later year weather score affects more than earlier
+year weather score.
+
+```{r}
+# Prepare accumulated data (filter out year, week, and month)
+accumulated_data <- open_main_df %>%
+  mutate(DATE = ymd(DATE)) %>%
+  group_by(year = year(DATE), week = week(DATE), month = month(DATE)) %>%
+  summarise(weekly_weather_score = mean(weather_score, na.rm = TRUE), .groups = 'drop')
+
+# Fill missing scores with 0 or appropriate method
+accumulated_data_complete <- accumulated_data %>%
+  mutate(
+    weekly_weather_score = ifelse(is.na(weekly_weather_score), 0, weekly_weather_score)
+  )
+
+
+# Target month
+target_month <- c(1, 2, 9, 10, 11, 12)
+
+# Define weights for each year, with more recent years having higher weights
+years <- unique(accumulated_data_complete$year)
+weights <- seq(1, 1.2, length.out = length(years)) # 1: min weight, 2: max weight
+names(weights) <- years
+
+
+# Function to calculate weighted cumulative score
+calculate_weighted_cumulative_score <- function(data) {
+  data %>%
+    arrange(year) %>%
+    mutate(weighted_weather_score = weekly_weather_score * weights[as.character(year)],
+           cumulative_score = cumsum(weighted_weather_score))
+}
+
+# Calculate weighted cumulative score
+accumulated_data_complete <- accumulated_data_complete %>%
+  group_by(week, month) %>%
+  group_modify(~ calculate_weighted_cumulative_score(.x)) %>%
+  ungroup()
+
+print(paste("min:.", min(accumulated_data_complete$cumulative_score), ", max:", max(accumulated_data_complete$cumulative_score)))
+minimum <- round(min(accumulated_data_complete$cumulative_score))
+maximum <- round(max(accumulated_data_complete$cumulative_score))
+```
+
+```{r}
+# function: number -> month abbreviation
+get_month_abbr <- function(month_num) {
+  month_abbr <- c("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+  if (month_num >= 1 & month_num <= 12) {
+    return(month_abbr[month_num])
+  } else {
+    return("Invalid month number")
+  }
+}
+```
+
+```{r}
+plots <- list()
+
+for (m in target_month){
+  max_y <- max(accumulated_data_complete$year[accumulated_data_complete$month == m])
+  
+  final_scores <- accumulated_data_complete %>% 
+    filter((year == max_y & month==m))  %>% 
+    select(year, week, cumulative_score)
+
+  week <- unique(accumulated_data_complete$week[accumulated_data_complete$month == m])
+  
+  p <- ggplot(accumulated_data_complete %>% filter(month == m), aes(x = year, y = cumulative_score, color = factor(week), group = week)) +
+    geom_line(size = 1) +
+    geom_point(size = 2) +
+    geom_text(data = final_scores, aes(x = max_y, y = cumulative_score, label = round(cumulative_score, 1)), 
+              hjust = -0.1, vjust = 1, color = "black", size = 3, check_overlap = TRUE) +
+    labs(title = paste("Cumulative Weather Score by Year:", get_month_abbr(m)),
+         x = "Year",
+         y = "Cumulative Weather Score") +
+    theme_minimal() +
+    theme(legend.position = "bottom", plot.title = element_text(size = 10), 
+          legend.title = element_text(size = 8), legend.text = element_text(size = 6),
+          axis.title = element_text(size = 8)) +
+    scale_color_brewer(palette = "Set3", labels = paste('week', week)) +
+    scale_x_continuous(breaks = seq(2018, 2022, 1)) +
+    scale_y_continuous(limits = c(minimum - 1, maximum + 1), breaks = seq(minimum, maximum, 5))
+  
+  # Print and save graphs
+  print(p)
+  # ggsave(paste("cumulative_weather_score_", get_month_abbr(m), ".png", sep = ""), p, width = 3, height = 4)
+}
+```
+
+February and September shows high weather cumulative weather score, at 13.4 and
+19.3 respectively. The last two weeks of February and first week and last week of September
+showed significantly high weather score. It could be obvious that those weeks are
+closer to the spring and summer, but the last week of September is a quite
+meaningful results.
+
+### Finding the Best Day in a Given Month
+
+Now that we've narrowed down our choices, we can determine the best possible
+day to visit each selected month. In order to do this, we can take the mean
+average waiting time for each day in the month and select the day with the 
+lowest average waiting time. 
+
+```{r}
+# Custom Function For Best Day
+
+FindBestDayByMonth <- function(wait_data, month) {
+  lowest_month_days <- wait_data %>% filter(MONTH == month) %>% group_by(WDAY) %>% 
+  summarise(wait = mean(AVG_WAIT_TIME), .groups = 'drop') %>% arrange(wait) %>% head()
+
+  best_day <- lowest_month_days %>% subset(wait == min(wait))
+
+  best_day$MONTH <- month
+  
+  return(best_day)
+}
+```
+
+```{r}
+# wait_data = open_main_df OR main_df
+# best_day = weekday, month, time (ex. "Mon" "Sep" "11.4")
+
+AnalyzeBestDay <- function(wait_data, best_day) {
+  best_day_df <- wait_data %>%
+  filter(WDAY == best_day$WDAY, MONTH == best_day$MONTH) %>% group_by(RIDE, WDAY, MONTH) %>%
+    summarise(wait_time = mean(AVG_WAIT_TIME), .groups = 'drop') 
+
+  best_day_df$total_avg_wait <- sum(best_day_df$wait_time)
+  best_day_df$day_wait_avg <- mean(best_day_df$wait_time)
+  
+  colnames(best_day_df)[4] <- "ride_mean_wait_best"
+  colnames(best_day_df)[5] <- "total_wait_best"
+  colnames(best_day_df)[6] <- "day_mean_wait_best"
+  
+  return(best_day_df)
+}
+```
+
+```{r}
+# Data must be open_main_df or main_df
+# Graph_id: 1 - Difference in Ride Wait Times. 
+#           2 - New Standardize Wait Times
+#           3 - No graph; return best_day_df
+
+CompareBestToOrig <- function(data, best_day, graph_id) {
+  best_day_df <- AnalyzeBestDay(data, best_day)
+  
+  orig_data <-  data %>% group_by(RIDE) %>%
+    summarise(wait = mean(AVG_WAIT_TIME), .groups = 'drop')
+
+  orig_data <- orig_data %>% filter(RIDE %in% best_day_df$RIDE)
+
+  best_day_df <- left_join(best_day_df, orig_data)
+  best_day_df <- best_day_df %>% rename(ride_mean_wait_original = wait)
+
+  best_day_df$total_wait_original <- sum(best_day_df$ride_mean_wait_original)
+
+  orig_data <- data %>% group_by(DATE) %>% summarise(wait = mean(AVG_WAIT_TIME))
+
+  best_day_df$day_mean_wait_original <- mean(orig_data$wait)
+  
+  if(graph_id == 1) {
+    
+      ggplot(best_day_df, aes(x = RIDE, y = (ride_mean_wait_best - ride_mean_wait_original))) +
+      geom_bar(stat = "identity", fill = "springgreen3", alpha = 0.7) +
+      labs(title = "Difference in Ride Wait Times on the Best Day",
+        x = "Ride",
+        y = "Difference") +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+    
+  } else if (graph_id == 2) {
+    
+      ride_waits <- best_day_df
+
+      mean_wait_all <- data %>% group_by(RIDE) %>% summarise(wait = mean(AVG_WAIT_TIME)) %>%
+      select(wait) %>% unlist() %>% mean()
+
+      ride_waits$st_wait_time <-
+      ((ride_waits$ride_mean_wait_best - mean_wait_all) / sd(ride_waits$ride_mean_wait_best))
+
+      ride_waits %>%
+      ggplot(aes(x = reorder(RIDE, st_wait_time), y = st_wait_time,
+             fill = factor(st_wait_time > 0, levels = c("TRUE", "FALSE")))) +
+           geom_bar(stat = 'identity', width= 0.7) + coord_flip() +
+      scale_fill_manual(
+      values = c("TRUE" = "springgreen3", "FALSE" = "tomato"),
+      labels = c("TRUE" = "Above Average", "FALSE" = "Below Average")
+      ) + labs(title = "Normalized Wait Times by Ride - Best Day", x = 
+                 "Standardized Wait Time", y = "Ride", fill = "Wait Time")
+    
+  } else {
+    
+    return(best_day_df) 
+    
+  }
+}
+```
+
+```{r}
+# Using custom functions to find and analyze best day data...
+
+Feb <- FindBestDayByMonth(open_main_df, "Feb") %>% CompareBestToOrig(data = open_main_df, graph_id = -1)
+Sep <- FindBestDayByMonth(open_main_df, "Sep") %>% CompareBestToOrig(data = open_main_df, graph_id = -1)
+
+feb_and_sep <- rbind(Feb, Sep)
+
+temp <- feb_and_sep %>%
+  select(RIDE, MONTH, ride_mean_wait_original, total_wait_original, day_mean_wait_original) %>%
+  rename(
+    ride_avg_wait = ride_mean_wait_original,
+    total_wait = total_wait_original,
+    day_avg_wait = day_mean_wait_original
+  ) %>%
+  mutate(TYPE = "Original")
+
+temp2 <- feb_and_sep %>%
+  select(RIDE, MONTH, ride_mean_wait_best, total_wait_best, day_mean_wait_best) %>%
+  rename(
+    ride_avg_wait = ride_mean_wait_best,
+    total_wait = total_wait_best,
+    day_avg_wait = day_mean_wait_best
+  ) %>%
+  mutate(TYPE = "Best")
+
+# Combine temp and temp2 into a single data frame 
+combined_temp <- rbind(temp, temp2)
+
+# Transform the data from wide to long format
+df_long <- combined_temp %>%
+  pivot_longer(cols = c(total_wait, day_avg_wait),
+               names_to = "Variable",
+               values_to = "Value")
+
+ggplot(df_long, aes(x = MONTH, y = Value, fill = TYPE)) +
+  geom_col(position = "dodge", alpha = 0.7) +
+  geom_text(aes(label = round(Value, 1)),
+            position = position_dodge(width = 0.9),
+            vjust = 5) +
+  facet_wrap(~ Variable, scales = "free_y") +
+  labs(title = "Comparison of Waiting Times: Original vs. Best Day", x = "", y = "Wait (Minutes)") +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  scale_fill_manual(values = c("Best" = "springgreen3", "Original" = "tomato")) +
+  scale_x_discrete(labels = c("Feb" = "Fri, Feb", "Sep" = "Tue, Sep"))
+```
+
+We can see here the differences in the average waiting time (for each ride) 
+during the best day as well as the total time spent waiting that day in comparison
+to the average values. It is clear that while both days significantly reduce 
+the waiting time, Tuesdays in September are the clear best option. 
+
+```{r, include = FALSE}
+FindBestDayByMonth(open_main_df, "Feb") %>% CompareBestToOrig(data = open_main_df, graph_id = 1)
+```
+
+Here are the readjusted normalized wait times for each ride on Fridays in February:
+
+```{r}
+FindBestDayByMonth(open_main_df, "Feb") %>% CompareBestToOrig(data = open_main_df, graph_id = 2)
+```
+
+```{r, include = FALSE}
+FindBestDayByMonth(open_main_df, "Sep") %>% CompareBestToOrig(data = open_main_df, graph_id = 1)
+```
+
+And here are the readjusted normalized wait times for each ride 
+on Tuesdays in September. We can clearly see that both are better than the 
+original normalized times, though Tuesdays in September bring a vast majority of 
+the rides below the mean average wait time. 
+
+```{r}
+FindBestDayByMonth(open_main_df, "Sep") %>% CompareBestToOrig(data = open_main_df, graph_id = 2)
+```
+
+Finally, we wanted to find the best time of day to ride the top five rides in
+each month (based on the highest mean waiting time). 
+
+```{r}
+feb_t5 <- Feb %>% select(RIDE, ride_mean_wait_best, WDAY, MONTH) %>% arrange(desc(ride_mean_wait_best))
+feb_t5 <- feb_t5[1:5,]
+
+feb_t5_data <- open_main_df %>% 
+  filter((RIDE %in% feb_t5$RIDE) & (WDAY == "Fri") & (MONTH == "Feb")) %>%
+  group_by(RIDE, TIME_OF_DAY, WDAY, MONTH) %>% summarise(mean_wait = mean(AVG_WAIT_TIME)) 
+
+###
+
+sep_t5 <- Sep %>% select(RIDE, ride_mean_wait_best, WDAY, MONTH) %>% arrange(desc(ride_mean_wait_best))
+sep_t5 <- sep_t5[1:5,]
+
+sep_t5_data <- open_main_df %>%
+  filter((RIDE %in% feb_t5$RIDE) & (WDAY == "Tue") & (MONTH == "Sep")) %>%
+  group_by(RIDE, TIME_OF_DAY, WDAY, MONTH) %>% summarise(mean_wait = mean(AVG_WAIT_TIME))
+
+combined_t5 <- rbind(sep_t5_data, feb_t5_data)
+
+min_wait_period <- combined_t5 %>% group_by(RIDE, TIME_OF_DAY) %>%
+  summarise(mean_wait = mean(mean_wait)) %>%
+  slice_min(mean_wait, with_ties = FALSE) %>% ungroup()
+
+period_percentage <- min_wait_period %>% group_by(TIME_OF_DAY) %>%
+  summarise(count = n()) %>%
+  mutate(percentage = count / sum(count) * 100)
+
+feb_t5 <- rename(feb_t5, MEAN_WAIT = ride_mean_wait_best)
+sep_t5 <- rename(sep_t5, MEAN_WAIT = ride_mean_wait_best)
+
+feb_t5
+sep_t5
+
+ggplot(period_percentage, aes(x = "", y = percentage, fill = TIME_OF_DAY)) +
+  geom_bar(width = 1, stat = "identity") +
+  coord_polar(theta = "y") +
+  labs(title = "Percentage of Each Time of Day with Lowest Mean Wait Time",
+       x = NULL, y = NULL) +
+  theme_void() +
+  theme(legend.title = element_blank()) +
+  geom_text(aes(label = paste0(round(percentage, 1), "%")),
+            position = position_stack(vjust = 0.5))
+```
+
+In this very simplistic pie chart, we can clearly see that the best time to 
+ride the "busiest" rides would be in the evening. 
+
+---
+
+Based on our findings, we concluded the following:
+* Rain tends to result in decreased waiting times
+* Jimin and Minyeong would prefer to visit WDW on a Tuesday in September on 
+either week 35 or 38, but may have to come during February on Friday on week 9
+(Winter Break, second best option).
+
+---
+
+# EDA - Deeper Analysis (Linear Regression and Clustering)
+
+### Correlation Plot to Identify Variable Relationships
+
+```{r}
+cor(open_main_df[, sapply(open_main_df, is.numeric)]) %>% corrplot(method = "number", tl.cex = 0.6)
+```
+
+The only meaningful relationship that may be able to be explored further is the
+relationship between open time and the average wait time, which has an apparent
+correlation of ~50%.
+
+```{r}
+summary(lm(data = open_main_df, OPEN_TIME ~ AVG_WAIT_TIME))
+```
+
+When creating a linear model between open time and wait time, we can see that
+the relationship is significant, with an adjusted R-squared of around 25%. From
+this, we can say that 25% of the variance in the average waiting time can be 
+explained by the open time. 
+
+So, while open time has the strongest correlation with waiting times, it is 
+still a fairly weak relationship. 
+
+### CLUSTERING
+
+Clustering rides by avg open time and avg waiting time
+-> By comparing the clusters, we can see the correlation of waiting time and open time.
+
+Making avg open time dataframe of rides
+```{r}
+mean_open_df <- open_main_df %>%
+  group_by(RIDE) %>%
+  summarise(mean_open_time = mean(OPEN_TIME, na.rm = TRUE))
+```
+
+Scailing & k-means clustering
+```{r}
+scaled_open_time <- scale(mean_open_df$mean_open_time)
+kmeans_result <- kmeans(scaled_open_time, centers = 3)
+mean_open_df$cluster <- as.factor(kmeans_result$cluster)
+```
+
+Plot the result
+
+```{r}
+mean_open_df$cluster <- factor(mean_open_df$cluster, levels = unique(mean_open_df$cluster[order(mean_open_df$mean_open_time)]))
+levels(mean_open_df$cluster) <- 1:length(levels(mean_open_df$cluster))
+
+ggplot(mean_open_df, aes(x = RIDE, y = mean_open_time, color = cluster)) +
+  geom_point(size = 3) +
+  labs(title = "Clustering of Rides based on Mean Open Time",
+       x = "Ride",
+       y = "Mean Open Time (scaled)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_color_manual(values = c("1" = "lightblue", "2" = "lightgreen", "3" = "lightpink"),
+                     labels = c("1" = "Short", "2" = "Medium", "3" = "Long"))
+
+```
+
+
+Text result
+```{r}
+clustered_rides_open <- mean_open_df %>%
+  group_by(cluster) %>%
+  summarize(rides_in_cluster = paste(RIDE, collapse = ", "))
+clustered_rides_open
+```
+
+
+Making avg waiting time dataframe of rides
+```{r}
+mean_wait_df <- open_main_df %>%
+  group_by(RIDE) %>%
+  summarise(mean_wait_time = mean(AVG_WAIT_TIME, na.rm = TRUE))
+```
+
+Scailing & k-means clustering
+```{r}
+scaled_wait_time <- scale(mean_wait_df$mean_wait_time)
+kmeans_result_w <- kmeans(scaled_wait_time, centers = 3)
+mean_wait_df$cluster <- as.factor(kmeans_result_w$cluster)
+```
+
+Plot the result
+```{r}
+mean_wait_df$cluster <- factor(mean_wait_df$cluster, levels = unique(mean_wait_df$cluster[order(mean_wait_df$mean_wait_time)]))
+levels(mean_wait_df$cluster) <- 1:length(levels(mean_wait_df$cluster))
+
+ggplot(mean_wait_df, aes(x = RIDE, y = mean_wait_time, color = cluster)) +
+  geom_point(size = 3) +
+  labs(title = "Clustering of Rides based on Mean Wait Time",
+       x = "Ride",
+       y = "Mean Wait Time (scaled)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_color_manual(values = c("1" = "lightblue", "2" = "lightgreen", "3" = "lightpink"),
+                     labels = c("1" = "Short", "2" = "Medium", "3" = "Long"))
+```
+
+Text result
+```{r}
+clustered_rides_wait <- mean_wait_df %>%
+  group_by(cluster) %>%
+  summarize(rides_in_cluster = paste(RIDE, collapse = ", "))
+clustered_rides_wait
+```
+
+Comparing Longest open time cluster and Shortest waiting time cluster
+```{r}
+cluster_1_wait <- clustered_rides_wait$rides_in_cluster[clustered_rides_wait$cluster == 1]
+cluster_3_open <- clustered_rides_open$rides_in_cluster[clustered_rides_open$cluster == 3]
+matched_rides1 <- intersect(cluster_1_wait, cluster_3_open)
+matched_rides1
+```
+
+Comparing Longest waiting time cluster and Shortest open time cluster
+```{r}
+cluster_3_wait <- clustered_rides_wait$rides_in_cluster[clustered_rides_wait$cluster == 3]
+cluster_1_open <- clustered_rides_open$rides_in_cluster[clustered_rides_open$cluster == 1]
+matched_rides2 <- intersect(cluster_3_wait, cluster_1_open)
+matched_rides2
+```
+
+Since the correlation of waiting time and open time is 0.50, we thought as the 
+open time is long, the ride is operates for a long time and the waiting time
+might be short. So We expected to check the correlation between waiting time and 
+open time by clustering rides by waiting time and open time. 
+
+What can be observed from the clusters are the different groupings
+of rides based on whether their waiting and open time are low, medium, or high.
+However, the resulting intersection showed no matching ride that is both
+included in the longest open time cluster and the shortest waiting time 
+cluster. There was also no cluster that is both included in the longest 
+waiting time cluster and shortest open time cluster. 
+
+We have found the correlation of open time and waiting time, but it was hard to 
+see the actual correlation from our data set.
