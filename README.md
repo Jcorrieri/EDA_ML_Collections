@@ -4,5 +4,6 @@ Group project entitled 'Maximizing Enjoyment: Reducing Wait Times at Walt Disney
 **Team Members:** \
 Jacomo Corrieri (Team Leader), \
 Lee Jimin, \
-Kim Minyeong
-
+Kim Minyeong \
+\
+See FinalReport.md for EDA results.
